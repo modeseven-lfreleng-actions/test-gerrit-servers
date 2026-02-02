@@ -1,0 +1,207 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2025 The Linux Foundation
+
+# Test Gerrit server connectivity workflow
+name: "Test Gerrit Servers 🔗"
+
+# yamllint disable-line rule:truthy
+on:
+  workflow_dispatch:
+    inputs:
+      debug:
+        description: "Enable debug output"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "true"
+          - "false"
+      sync_on_startup:
+        description: "Trigger replication after startup"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  ### Extract non-sensitive matrix data ###
+  prepare:
+    name: "Prepare Gerrit matrix"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      # Harden the runner used by this workflow
+      # yamllint disable-line rule:line-length
+      - uses: step-security/harden-runner@20cf305ff2072d973412fa9b1e3a4f227bda3c76 # v2.14.0
+        with:
+          egress-policy: audit
+
+      - name: "Set matrix from repository variable"
+        id: set-matrix
+        env:
+          # GERRIT_SERVERS is a repository variable (not secret) containing:
+          # [{"project":"ONAP","slug":"onap","gerrit":"gerrit.onap.org",...}]
+          GERRIT_SERVERS: ${{ vars.GERRIT_SERVERS }}
+        run: |
+          # Set matrix from GERRIT_SERVERS repository variable
+          if [ -z "$GERRIT_SERVERS" ]; then
+            echo "::error::GERRIT_SERVERS variable is not set"
+            exit 1
+          fi
+
+          # Validate JSON format
+          if ! echo "$GERRIT_SERVERS" | jq empty 2>/dev/null; then
+            echo "::error::GERRIT_SERVERS is not valid JSON"
+            exit 1
+          fi
+
+          # Output matrix for downstream jobs
+          MATRIX=$(echo "$GERRIT_SERVERS" | jq -c '.')
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+          COUNT=$(echo "$GERRIT_SERVERS" | jq '. | length')
+          echo "Matrix prepared with $COUNT Gerrit servers"
+
+  ### Test Gerrit server connectivity ###
+  test-gerrit:
+    name: "Test ${{ matrix.server.name }}"
+    runs-on: ubuntu-latest
+    needs: prepare
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        server: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      # Harden the runner used by this workflow
+      # yamllint disable-line rule:line-length
+      - uses: step-security/harden-runner@20cf305ff2072d973412fa9b1e3a4f227bda3c76 # v2.14.0
+        with:
+          egress-policy: audit
+
+      - name: "Checkout repository"
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+
+      - name: "Lookup credentials for ${{ matrix.server.slug }}"
+        id: credentials
+        env:
+          GERRIT_CREDENTIALS_B64: ${{ secrets.GERRIT_CREDENTIALS }}
+          SERVER_SLUG: ${{ matrix.server.slug }}
+        run: |
+          # Lookup credentials for this server from the base64-encoded secret
+          if [ -z "$GERRIT_CREDENTIALS_B64" ]; then
+            echo "::error::GERRIT_CREDENTIALS secret is not set"
+            exit 1
+          fi
+
+          # Decode base64-encoded credentials JSON
+          # The secret is stored as base64 to avoid GitHub's spurious redactions
+          GERRIT_CREDENTIALS=$(echo "$GERRIT_CREDENTIALS_B64" \
+            | base64 -d 2>/dev/null)
+          if [ -z "$GERRIT_CREDENTIALS" ]; then
+            echo "::error::Failed to decode GERRIT_CREDENTIALS (invalid base64)"
+            exit 1
+          fi
+
+          # Validate JSON format
+          if ! echo "$GERRIT_CREDENTIALS" | jq empty 2>/dev/null; then
+            echo "::error::Decoded GERRIT_CREDENTIALS is not valid JSON"
+            exit 1
+          fi
+
+          CREDS=$(echo "$GERRIT_CREDENTIALS" | \
+            jq -r --arg slug "$SERVER_SLUG" '.[] | select(.slug == $slug)')
+
+          if [ -z "$CREDS" ]; then
+            echo "::error::No credentials found for slug: $SERVER_SLUG"
+            exit 1
+          fi
+
+          # Extract and mask sensitive values
+          USERNAME=$(echo "$CREDS" | jq -r '.username')
+          PASSWORD=$(echo "$CREDS" | jq -r '.password')
+
+          # Mask the password in logs
+          echo "::add-mask::$PASSWORD"
+
+          # Set outputs for use in subsequent steps
+          echo "username=$USERNAME" >> "$GITHUB_OUTPUT"
+          echo "password=$PASSWORD" >> "$GITHUB_OUTPUT"
+
+      - name: "Test Gerrit server: ${{ matrix.server.gerrit }}"
+        id: gerrit
+        # yamllint disable-line rule:line-length
+        uses: modeseven-lfreleng-actions/gerrit-action@update-action  # Testing
+        with:
+          gerrit_setup: |
+            [{
+              "project": "${{ matrix.server.project_filter || '' }}",
+              "slug": "${{ matrix.server.slug }}",
+              "gerrit": "${{ matrix.server.gerrit }}",
+              "api_path": "${{ matrix.server.api_path }}"
+            }]
+          auth_type: http_basic
+          http_username: ${{ steps.credentials.outputs.username }}
+          http_password: ${{ steps.credentials.outputs.password }}
+          sync_on_startup: ${{ inputs.sync_on_startup || 'false' }}
+          debug: ${{ inputs.debug || 'false' }}
+          check_service: true
+          exit: true
+
+      - name: "Report success: ${{ matrix.server.name }}"
+        env:
+          API_PATHS: ${{ steps.gerrit.outputs.api_paths }}
+        run: |
+          # Report success
+          {
+            echo "## ✅ ${{ matrix.server.name }}"
+            echo ""
+            echo "Successfully connected to \`${{ matrix.server.gerrit }}\`"
+            echo ""
+            echo "### API Path Information"
+            echo '```json'
+            echo "$API_PATHS" | jq '.'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  ### Summary job ###
+  summary:
+    name: "Test Summary"
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    needs: [prepare, test-gerrit]
+    if: always()
+    permissions:
+      contents: read
+    steps:
+      - name: "Generate summary"
+        run: |
+          # Generate test summary
+          {
+            echo "# Gerrit Server Test Results 📊"
+            echo ""
+            echo "| Status | Details |"
+            echo "|--------|---------|"
+            echo "| Preparation | ${{ needs.prepare.result }} |"
+            echo "| Gerrit Tests | ${{ needs.test-gerrit.result }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: "Check overall result"
+        if: needs.test-gerrit.result != 'success'
+        run: |
+          echo "::error::One or more Gerrit server tests failed"
+          exit 1
