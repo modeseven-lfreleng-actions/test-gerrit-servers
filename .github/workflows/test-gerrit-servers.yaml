@@ -313,10 +313,13 @@ jobs:
           CONTAINER_IDS: ${{ steps.gerrit.outputs.container_ids }}
         run: |
           # Cleanup Gerrit containers
+          # Note: containers no longer use --rm flag, must explicitly remove
           if [ -n "$CONTAINER_IDS" ]; then
             for cid in $(echo "$CONTAINER_IDS" | jq -r '.[]'); do
               echo "Stopping container: $cid"
               docker kill "$cid" 2>/dev/null || echo "Container already stopped"
+              echo "Removing container: $cid"
+              docker rm "$cid" 2>/dev/null || echo "Container already removed"
             done
             echo "ONAP Gerrit container cleanup completed ✅"
           fi
