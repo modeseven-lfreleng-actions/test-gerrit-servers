@@ -17,7 +17,7 @@ on:
       debug_minutes:
         description: "Minutes to keep tunnel open (max 60)"
         required: false
-        default: 30
+        default: 15
         type: number
       sync_on_startup:
         description: "Trigger replication after startup"
@@ -142,7 +142,7 @@ jobs:
       - name: "Start Gerrit mirror"
         id: gerrit
         # yamllint disable-line rule:line-length
-        uses: modeseven-lfreleng-actions/gerrit-action@refactor-replication
+        uses: modeseven-lfreleng-actions/gerrit-action@refactor-replication  # Testing
         with:
           gerrit_setup: |
             [{
@@ -177,125 +177,204 @@ jobs:
 
       - name: "Start bore tunnels"
         id: tunnels
+        env:
+          INSTANCES: ${{ steps.gerrit.outputs.instances }}
+          SERVER_SLUG: ${{ inputs.server_slug }}
+          API_PATH: ${{ steps.server.outputs.api_path }}
         run: |
           # Start bore tunnels for HTTP and SSH ports
+          # Uses dynamic ports from gerrit-action outputs
           echo "Starting bore tunnels to bore.pub..."
 
-          # Start HTTP tunnel (port 8080)
-          bore local 8080 --to bore.pub > bore-http.log 2>&1 &
-          HTTP_PID=$!
-          echo "http_pid=$HTTP_PID" >> "$GITHUB_OUTPUT"
+          # Extract ports from gerrit-action instances output
+          LOCAL_HTTP=$(echo "$INSTANCES" | \
+            jq -r --arg s "$SERVER_SLUG" '.[$s].http_port // 8080')
+          LOCAL_SSH=$(echo "$INSTANCES" | \
+            jq -r --arg s "$SERVER_SLUG" '.[$s].ssh_port // 29418')
 
-          # Start SSH tunnel (port 29418)
-          bore local 29418 --to bore.pub > bore-ssh.log 2>&1 &
-          SSH_PID=$!
-          echo "ssh_pid=$SSH_PID" >> "$GITHUB_OUTPUT"
+          echo "local_http_port=$LOCAL_HTTP" >> "$GITHUB_OUTPUT"
+          echo "local_ssh_port=$LOCAL_SSH" >> "$GITHUB_OUTPUT"
+
+          # Start HTTP tunnel
+          bore local "$LOCAL_HTTP" --to bore.pub > bore-http.log 2>&1 &
+          echo "http_pid=$!" >> "$GITHUB_OUTPUT"
+
+          # Start SSH tunnel
+          bore local "$LOCAL_SSH" --to bore.pub > bore-ssh.log 2>&1 &
+          echo "ssh_pid=$!" >> "$GITHUB_OUTPUT"
 
           # Wait for tunnels to establish
           echo "Waiting for tunnels to establish..."
           sleep 10
 
           # Extract assigned ports from logs
-          HTTP_PORT=$(grep -oP 'listening at bore\.pub:\K\d+' bore-http.log \
-            || echo "")
-          SSH_PORT=$(grep -oP 'listening at bore\.pub:\K\d+' bore-ssh.log \
-            || echo "")
+          HTTP_PORT=$(grep -oP 'listening at bore\.pub:\K\d+' \
+            bore-http.log || echo "")
+          SSH_PORT=$(grep -oP 'listening at bore\.pub:\K\d+' \
+            bore-ssh.log || echo "")
 
           if [ -z "$HTTP_PORT" ]; then
             echo "::warning::Could not determine HTTP tunnel port"
-            echo "HTTP tunnel log:"
             cat bore-http.log
           else
             echo "http_port=$HTTP_PORT" >> "$GITHUB_OUTPUT"
-            echo "HTTP tunnel: bore.pub:$HTTP_PORT -> localhost:8080"
+            echo "HTTP: bore.pub:$HTTP_PORT -> localhost:$LOCAL_HTTP"
           fi
 
           if [ -z "$SSH_PORT" ]; then
             echo "::warning::Could not determine SSH tunnel port"
-            echo "SSH tunnel log:"
             cat bore-ssh.log
           else
             echo "ssh_port=$SSH_PORT" >> "$GITHUB_OUTPUT"
-            echo "SSH tunnel: bore.pub:$SSH_PORT -> localhost:29418"
+            echo "SSH: bore.pub:$SSH_PORT -> localhost:$LOCAL_SSH"
           fi
+
+      - name: "Update Gerrit URLs for bore tunnels"
+        env:
+          INSTANCES: ${{ steps.gerrit.outputs.instances }}
+          SERVER_SLUG: ${{ inputs.server_slug }}
+          HTTP_PORT: ${{ steps.tunnels.outputs.http_port }}
+          SSH_PORT: ${{ steps.tunnels.outputs.ssh_port }}
+          API_PATH: ${{ steps.server.outputs.api_path }}
+        run: |
+          # Update Gerrit's URLs so clone commands show bore addresses
+          CID=$(echo "$INSTANCES" | \
+            jq -r --arg s "$SERVER_SLUG" '.[$s].cid')
+
+          if [ -z "$CID" ] || [ "$CID" = "null" ]; then
+            echo "::warning::Container not found, skipping URL update"
+            exit 0
+          fi
+
+          CONFIG="/var/gerrit/etc/gerrit.config"
+
+          # Update HTTP canonical URL
+          if [ -n "$HTTP_PORT" ]; then
+            NEW_URL="http://bore.pub:${HTTP_PORT}${API_PATH}"
+            echo "Setting canonicalWebUrl: $NEW_URL"
+            docker exec "$CID" git config -f "$CONFIG" \
+              gerrit.canonicalWebUrl "$NEW_URL"
+          fi
+
+          # Update SSH advertised address
+          if [ -n "$SSH_PORT" ]; then
+            SSH_ADDR="bore.pub:${SSH_PORT}"
+            echo "Setting sshd.advertisedAddress: $SSH_ADDR"
+            docker exec "$CID" git config -f "$CONFIG" \
+              sshd.advertisedAddress "$SSH_ADDR"
+          fi
+
+          # Flush caches to pick up the changes
+          echo "Flushing Gerrit caches..."
+          docker exec "$CID" bash -c '
+            ssh -o StrictHostKeyChecking=no \
+                -o UserKnownHostsFile=/dev/null \
+                -p 29418 admin@localhost \
+                gerrit flush-caches --all 2>/dev/null || true
+          ' || true
+
+          echo "Gerrit URLs updated for bore tunnels ✅"
 
       - name: "Display connection info"
         env:
           HTTP_PORT: ${{ steps.tunnels.outputs.http_port }}
           SSH_PORT: ${{ steps.tunnels.outputs.ssh_port }}
+          LOCAL_HTTP: ${{ steps.tunnels.outputs.local_http_port }}
+          LOCAL_SSH: ${{ steps.tunnels.outputs.local_ssh_port }}
           DEBUG_MINUTES: ${{ steps.validate.outputs.debug_minutes }}
           SERVER_NAME: ${{ steps.server.outputs.name }}
           API_PATH: ${{ steps.server.outputs.api_path }}
+          SERVER_SLUG: ${{ inputs.server_slug }}
         run: |
           # Display connection information
+          # Build tunnel info array for iteration
+          declare -a TUNNELS=()
+
+          if [ -n "$HTTP_PORT" ]; then
+            HTTP_URL="http://bore.pub:${HTTP_PORT}${API_PATH}"
+            TUNNELS+=("http|Web UI|$LOCAL_HTTP|$HTTP_PORT|$HTTP_URL")
+          fi
+          if [ -n "$SSH_PORT" ]; then
+            TUNNELS+=("ssh|SSH/Git|$LOCAL_SSH|$SSH_PORT|ssh://admin@bore.pub:${SSH_PORT}")
+          fi
+
           {
             echo "# 🔧 Debug Session: $SERVER_NAME"
             echo ""
-            echo "## Connection Details"
+            echo "## 🌐 Public Access Ports"
             echo ""
+            echo "| Service | Local Port | Public Port | Public URL |"
+            echo "|---------|------------|-------------|------------|"
+
+            for t in "${TUNNELS[@]}"; do
+              IFS='|' read -r _ LABEL LOCAL PUBLIC URL <<< "$t"
+              echo "| **$LABEL** | $LOCAL | $PUBLIC | \`$URL\` |"
+            done
+
+            if [ ${#TUNNELS[@]} -eq 0 ]; then
+              echo "| ❌ No tunnels | - | - | - |"
+            fi
+
+            echo ""
+            echo "## 🔗 Quick Access"
+            echo ""
+
             if [ -n "$HTTP_PORT" ]; then
-              echo "### HTTP (Web UI / REST API)"
-              echo '```'
-              echo "URL: http://bore.pub:$HTTP_PORT$API_PATH"
-              echo '```'
+              echo "### Gerrit Web Portal"
               echo ""
-              echo "Example API call:"
+              echo "**URL**: http://bore.pub:$HTTP_PORT$API_PATH"
+              echo ""
               echo '```bash'
-              API_URL="http://bore.pub:$HTTP_PORT${API_PATH}"
-              echo "curl -s ${API_URL}/config/server/version"
-              echo '```'
+              echo "# Check version"
+              URL="http://bore.pub:$HTTP_PORT$API_PATH"
+              echo "curl -s $URL/config/server/version"
               echo ""
-            else
-              echo "### HTTP tunnel failed to start"
+              echo "# List projects"
+              echo "curl -s http://bore.pub:$HTTP_PORT$API_PATH/projects/"
+              echo '```'
               echo ""
             fi
+
             if [ -n "$SSH_PORT" ]; then
-              echo "### SSH (Git operations)"
-              echo '```'
-              echo "Host: bore.pub"
-              echo "Port: $SSH_PORT"
-              echo "Username: admin"
-              echo '```'
+              echo "### SSH Access"
               echo ""
-              echo "Example SSH connection:"
               echo '```bash'
+              echo "# Test connection"
               echo "ssh -p $SSH_PORT admin@bore.pub gerrit version"
-              echo '```'
               echo ""
-              echo "Example git clone:"
-              echo '```bash'
-              echo "git clone ssh://admin@bore.pub:$SSH_PORT/REPO_NAME"
+              echo "# Clone a repository"
+              echo "git clone ssh://admin@bore.pub:$SSH_PORT/PROJECT_NAME"
               echo '```'
-              echo ""
-            else
-              echo "### SSH tunnel failed to start"
               echo ""
             fi
-            echo "## Session Info"
+
+            echo "## ⏱️ Session Info"
             echo ""
-            echo "- **Duration**: $DEBUG_MINUTES minutes"
+            echo "| Property | Value |"
+            echo "|----------|-------|"
+            echo "| Server | $SERVER_NAME (\`$SERVER_SLUG\`) |"
+            echo "| Duration | $DEBUG_MINUTES minutes |"
             DATE_FMT='+%Y-%m-%d %H:%M:%S %Z'
             EXPIRY=$(date -d "+$DEBUG_MINUTES minutes" "$DATE_FMT" \
               2>/dev/null || date -v+"${DEBUG_MINUTES}"M "$DATE_FMT")
-            echo "- **Expires**: approximately $EXPIRY"
+            echo "| Expires | $EXPIRY |"
             echo ""
-            echo "⚠️ **Security Note**: These URLs are publicly accessible!"
-            echo "The tunnels will close automatically when the job ends."
+            echo "> ⚠️ **Warning**: URLs are publicly accessible!"
             echo ""
           } >> "$GITHUB_STEP_SUMMARY"
 
-          # Also output to logs
-          echo "============================================"
-          echo "🔧 DEBUG SESSION ACTIVE"
-          echo "============================================"
-          if [ -n "$HTTP_PORT" ]; then
-            echo "HTTP: http://bore.pub:$HTTP_PORT$API_PATH"
-          fi
-          if [ -n "$SSH_PORT" ]; then
-            echo "SSH:  ssh -p $SSH_PORT admin@bore.pub"
-          fi
-          echo "Duration: $DEBUG_MINUTES minutes"
-          echo "============================================"
+          # Console output
+          echo ""
+          echo "========================================"
+          echo "  DEBUG SESSION ACTIVE"
+          echo "========================================"
+          for t in "${TUNNELS[@]}"; do
+            IFS='|' read -r _ LABEL _ _ URL <<< "$t"
+            printf "  %-10s %s\n" "$LABEL:" "$URL"
+          done
+          echo "  Duration:  $DEBUG_MINUTES minutes"
+          echo "========================================"
+          echo ""
 
       - name: "Keep session alive"
         env:
