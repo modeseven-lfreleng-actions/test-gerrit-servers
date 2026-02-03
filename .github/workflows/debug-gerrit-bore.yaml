@@ -1,0 +1,341 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2025 The Linux Foundation
+
+# Debug Gerrit with remote access via bore tunnel
+name: "Debug Gerrit (bore tunnel) 🔧"
+
+# yamllint disable-line rule:truthy
+on:
+  workflow_dispatch:
+    inputs:
+      server_slug:
+        description: "Gerrit server to debug (from GERRIT_SERVERS)"
+        required: true
+        default: "onap"
+        type: string
+      debug_minutes:
+        description: "Minutes to keep tunnel open (max 60)"
+        required: false
+        default: 30
+        type: number
+      sync_on_startup:
+        description: "Trigger replication after startup"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  debug-gerrit:
+    name: "Debug Gerrit via bore tunnel"
+    runs-on: ubuntu-latest
+    timeout-minutes: 65
+    permissions:
+      contents: read
+    steps:
+      # Harden the runner
+      # yamllint disable-line rule:line-length
+      - uses: step-security/harden-runner@20cf305ff2072d973412fa9b1e3a4f227bda3c76 # v2.14.0
+        with:
+          egress-policy: audit
+
+      - name: "Validate inputs"
+        id: validate
+        env:
+          DEBUG_MINUTES: ${{ inputs.debug_minutes || 30 }}
+        run: |
+          # Validate debug_minutes input
+          if ! [[ "$DEBUG_MINUTES" =~ ^[0-9]+$ ]]; then
+            echo "::error::debug_minutes must be an integer: $DEBUG_MINUTES"
+            exit 1
+          fi
+          if [ "$DEBUG_MINUTES" -gt 60 ]; then
+            echo "::warning::debug_minutes capped at 60 (was: $DEBUG_MINUTES)"
+            DEBUG_MINUTES=60
+          fi
+          if [ "$DEBUG_MINUTES" -lt 5 ]; then
+            echo "::warning::debug_minutes minimum is 5 (was: $DEBUG_MINUTES)"
+            DEBUG_MINUTES=5
+          fi
+          echo "debug_minutes=$DEBUG_MINUTES" >> "$GITHUB_OUTPUT"
+          echo "Validated debug_minutes: $DEBUG_MINUTES"
+
+      - name: "Checkout repository"
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+
+      - name: "Lookup server config"
+        id: server
+        env:
+          GERRIT_SERVERS: ${{ vars.GERRIT_SERVERS }}
+          SERVER_SLUG: ${{ inputs.server_slug }}
+        run: |
+          # Lookup server configuration from GERRIT_SERVERS variable
+          if [ -z "$GERRIT_SERVERS" ]; then
+            echo "::error::GERRIT_SERVERS variable is not set"
+            exit 1
+          fi
+
+          SERVER=$(echo "$GERRIT_SERVERS" | \
+            jq -r --arg slug "$SERVER_SLUG" '.[] | select(.slug == $slug)')
+
+          if [ -z "$SERVER" ]; then
+            echo "::error::No server found for slug: $SERVER_SLUG"
+            echo "Available slugs:"
+            echo "$GERRIT_SERVERS" | jq -r '.[].slug'
+            exit 1
+          fi
+
+          # Extract server details
+          echo "name=$(echo "$SERVER" | jq -r '.name')" >> "$GITHUB_OUTPUT"
+          echo "gerrit=$(echo "$SERVER" | jq -r '.gerrit')" >> "$GITHUB_OUTPUT"
+          echo "api_path=$(echo "$SERVER" | jq -r '.api_path')" >> "$GITHUB_OUTPUT"
+          PROJECT_FILTER=$(echo "$SERVER" | jq -r '.project_filter // ""')
+          echo "project_filter=$PROJECT_FILTER" >> "$GITHUB_OUTPUT"
+
+          echo "Server: $(echo "$SERVER" | jq -r '.name')"
+          echo "Gerrit: $(echo "$SERVER" | jq -r '.gerrit')"
+
+      - name: "Lookup credentials"
+        id: credentials
+        env:
+          GERRIT_CREDENTIALS_B64: ${{ secrets.GERRIT_CREDENTIALS }}
+          SERVER_SLUG: ${{ inputs.server_slug }}
+        run: |
+          # Lookup credentials for this server
+          if [ -z "$GERRIT_CREDENTIALS_B64" ]; then
+            echo "::error::GERRIT_CREDENTIALS secret is not set"
+            exit 1
+          fi
+
+          GERRIT_CREDENTIALS=$(echo "$GERRIT_CREDENTIALS_B64" \
+            | base64 -d 2>/dev/null)
+          if [ -z "$GERRIT_CREDENTIALS" ]; then
+            echo "::error::Failed to decode GERRIT_CREDENTIALS"
+            exit 1
+          fi
+
+          CREDS=$(echo "$GERRIT_CREDENTIALS" | \
+            jq -r --arg slug "$SERVER_SLUG" '.[] | select(.slug == $slug)')
+
+          if [ -z "$CREDS" ]; then
+            echo "::error::No credentials found for slug: $SERVER_SLUG"
+            exit 1
+          fi
+
+          USERNAME=$(echo "$CREDS" | jq -r '.username')
+          PASSWORD=$(echo "$CREDS" | jq -r '.password')
+          echo "::add-mask::$PASSWORD"
+          echo "username=$USERNAME" >> "$GITHUB_OUTPUT"
+          echo "password=$PASSWORD" >> "$GITHUB_OUTPUT"
+
+      - name: "Start Gerrit mirror"
+        id: gerrit
+        # yamllint disable-line rule:line-length
+        uses: modeseven-lfreleng-actions/gerrit-action@update-action  # Testing
+        with:
+          gerrit_setup: |
+            [{
+              "project": "${{ steps.server.outputs.project_filter }}",
+              "slug": "${{ inputs.server_slug }}",
+              "gerrit": "${{ steps.server.outputs.gerrit }}",
+              "api_path": "${{ steps.server.outputs.api_path }}"
+            }]
+          auth_type: http_basic
+          http_username: ${{ steps.credentials.outputs.username }}
+          http_password: ${{ steps.credentials.outputs.password }}
+          sync_on_startup: ${{ inputs.sync_on_startup }}
+          debug: "true"
+          check_service: true
+          exit: false
+
+      - name: "Install bore"
+        run: |
+          # Install bore TCP tunnel client
+          BORE_VERSION="0.5.2"
+          BORE_URL="https://github.com/ekzhang/bore/releases/download"
+          BORE_FILE="bore-v${BORE_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+
+          echo "Downloading bore v${BORE_VERSION}..."
+          curl -sSL "${BORE_URL}/v${BORE_VERSION}/${BORE_FILE}" | tar xz
+
+          # Verify installation
+          ./bore --version
+          sudo mv bore /usr/local/bin/
+          echo "bore installed successfully ✅"
+
+      - name: "Start bore tunnels"
+        id: tunnels
+        run: |
+          # Start bore tunnels for HTTP and SSH ports
+          echo "Starting bore tunnels to bore.pub..."
+
+          # Start HTTP tunnel (port 8080)
+          bore local 8080 --to bore.pub > bore-http.log 2>&1 &
+          HTTP_PID=$!
+          echo "http_pid=$HTTP_PID" >> "$GITHUB_OUTPUT"
+
+          # Start SSH tunnel (port 29418)
+          bore local 29418 --to bore.pub > bore-ssh.log 2>&1 &
+          SSH_PID=$!
+          echo "ssh_pid=$SSH_PID" >> "$GITHUB_OUTPUT"
+
+          # Wait for tunnels to establish
+          echo "Waiting for tunnels to establish..."
+          sleep 10
+
+          # Extract assigned ports from logs
+          HTTP_PORT=$(grep -oP 'listening at bore\.pub:\K\d+' bore-http.log \
+            || echo "")
+          SSH_PORT=$(grep -oP 'listening at bore\.pub:\K\d+' bore-ssh.log \
+            || echo "")
+
+          if [ -z "$HTTP_PORT" ]; then
+            echo "::warning::Could not determine HTTP tunnel port"
+            echo "HTTP tunnel log:"
+            cat bore-http.log
+          else
+            echo "http_port=$HTTP_PORT" >> "$GITHUB_OUTPUT"
+            echo "HTTP tunnel: bore.pub:$HTTP_PORT -> localhost:8080"
+          fi
+
+          if [ -z "$SSH_PORT" ]; then
+            echo "::warning::Could not determine SSH tunnel port"
+            echo "SSH tunnel log:"
+            cat bore-ssh.log
+          else
+            echo "ssh_port=$SSH_PORT" >> "$GITHUB_OUTPUT"
+            echo "SSH tunnel: bore.pub:$SSH_PORT -> localhost:29418"
+          fi
+
+      - name: "Display connection info"
+        env:
+          HTTP_PORT: ${{ steps.tunnels.outputs.http_port }}
+          SSH_PORT: ${{ steps.tunnels.outputs.ssh_port }}
+          DEBUG_MINUTES: ${{ steps.validate.outputs.debug_minutes }}
+          SERVER_NAME: ${{ steps.server.outputs.name }}
+          API_PATH: ${{ steps.server.outputs.api_path }}
+        run: |
+          # Display connection information
+          {
+            echo "# 🔧 Debug Session: $SERVER_NAME"
+            echo ""
+            echo "## Connection Details"
+            echo ""
+            if [ -n "$HTTP_PORT" ]; then
+              echo "### HTTP (Web UI / REST API)"
+              echo '```'
+              echo "URL: http://bore.pub:$HTTP_PORT$API_PATH"
+              echo '```'
+              echo ""
+              echo "Example API call:"
+              echo '```bash'
+              echo "curl -s http://bore.pub:$HTTP_PORT${API_PATH}/config/server/version"
+              echo '```'
+              echo ""
+            else
+              echo "### HTTP tunnel failed to start"
+              echo ""
+            fi
+            if [ -n "$SSH_PORT" ]; then
+              echo "### SSH (Git operations)"
+              echo '```'
+              echo "Host: bore.pub"
+              echo "Port: $SSH_PORT"
+              echo '```'
+              echo ""
+              echo "Example git clone:"
+              echo '```bash'
+              echo "git clone ssh://YOUR_USERNAME@bore.pub:$SSH_PORT/REPO_NAME"
+              echo '```'
+              echo ""
+            else
+              echo "### SSH tunnel failed to start"
+              echo ""
+            fi
+            echo "## Session Info"
+            echo ""
+            echo "- **Duration**: $DEBUG_MINUTES minutes"
+            echo "- **Expires**: approximately $(date -d "+$DEBUG_MINUTES minutes" \
+              '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null || \
+              date -v+${DEBUG_MINUTES}M '+%Y-%m-%d %H:%M:%S %Z')"
+            echo ""
+            echo "⚠️ **Security Note**: These URLs are publicly accessible!"
+            echo "The tunnels will close automatically when the job ends."
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Also output to logs
+          echo "============================================"
+          echo "🔧 DEBUG SESSION ACTIVE"
+          echo "============================================"
+          if [ -n "$HTTP_PORT" ]; then
+            echo "HTTP: http://bore.pub:$HTTP_PORT$API_PATH"
+          fi
+          if [ -n "$SSH_PORT" ]; then
+            echo "SSH:  ssh -p $SSH_PORT bore.pub"
+          fi
+          echo "Duration: $DEBUG_MINUTES minutes"
+          echo "============================================"
+
+      - name: "Keep session alive"
+        env:
+          DEBUG_MINUTES: ${{ steps.validate.outputs.debug_minutes }}
+        run: |
+          # Keep the session alive for the specified duration
+          echo "Session will remain active for $DEBUG_MINUTES minutes..."
+          echo "Cancel the workflow manually when you're done debugging."
+          echo ""
+
+          # Sleep with periodic status updates
+          TOTAL_SECONDS=$((DEBUG_MINUTES * 60))
+          ELAPSED=0
+          INTERVAL=60
+
+          while [ $ELAPSED -lt $TOTAL_SECONDS ]; do
+            REMAINING=$(( (TOTAL_SECONDS - ELAPSED) / 60 ))
+            echo "[$(date '+%H:%M:%S')] $REMAINING minutes remaining..."
+
+            # Check if tunnels are still running
+            if ! pgrep -f "bore local" > /dev/null; then
+              echo "::warning::bore tunnels have stopped unexpectedly"
+              echo "HTTP tunnel log:"
+              cat bore-http.log 2>/dev/null || echo "(no log)"
+              echo "SSH tunnel log:"
+              cat bore-ssh.log 2>/dev/null || echo "(no log)"
+            fi
+
+            sleep $INTERVAL
+            ELAPSED=$((ELAPSED + INTERVAL))
+          done
+
+          echo "Debug session time expired."
+
+      - name: "Cleanup"
+        if: always()
+        env:
+          CONTAINER_IDS: ${{ steps.gerrit.outputs.container_ids }}
+        run: |
+          # Cleanup tunnels and containers
+          echo "Cleaning up..."
+
+          # Stop bore tunnels
+          pkill -f "bore local" 2>/dev/null || true
+
+          # Stop Gerrit containers
+          if [ -n "$CONTAINER_IDS" ]; then
+            for cid in $(echo "$CONTAINER_IDS" | jq -r '.[]' 2>/dev/null); do
+              echo "Stopping container: $cid"
+              docker kill "$cid" 2>/dev/null || true
+            done
+          fi
+
+          echo "Cleanup complete ✅"
