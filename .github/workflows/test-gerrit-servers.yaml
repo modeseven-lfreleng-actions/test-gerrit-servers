@@ -20,11 +20,16 @@ on:
       sync_on_startup:
         description: "Trigger replication after startup"
         required: false
-        default: "false"
+        default: "true"
         type: choice
         options:
           - "true"
           - "false"
+      persist_minutes:
+        description: "Run Gerrit for this duration in minutes (max 180)"
+        required: false
+        default: 0
+        type: number
 
 concurrency:
   group: "${{ github.workflow }}-${{ github.ref }}"
@@ -33,6 +38,34 @@ concurrency:
 permissions: {}
 
 jobs:
+  ### Validate inputs ###
+  validate:
+    name: "Validate inputs"
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    permissions:
+      contents: read
+    outputs:
+      persist_minutes: ${{ steps.validate.outputs.persist_minutes }}
+    steps:
+      - name: "Validate persist_minutes"
+        id: validate
+        env:
+          PERSIST_MINUTES: ${{ inputs.persist_minutes || 0 }}
+        run: |
+          # Validate persist_minutes input
+          if ! [[ "$PERSIST_MINUTES" =~ ^[0-9]+$ ]]; then
+            echo "::error::persist_minutes not integer: $PERSIST_MINUTES"
+            exit 1
+          fi
+          if [ "$PERSIST_MINUTES" -gt 180 ]; then
+            echo "::error::persist_minutes ($PERSIST_MINUTES) exceeds maximum"
+            echo "::error::maximum value of timeout-minutes is 180"
+            exit 1
+          fi
+          echo "persist_minutes=$PERSIST_MINUTES" >> "$GITHUB_OUTPUT"
+          echo "Validated persist_minutes: $PERSIST_MINUTES"
+
   ### Extract non-sensitive matrix data ###
   prepare:
     name: "Prepare Gerrit matrix"
@@ -74,9 +107,9 @@ jobs:
           COUNT=$(echo "$GERRIT_SERVERS" | jq '. | length')
           echo "Matrix prepared with $COUNT Gerrit servers"
 
-  ### Test Gerrit server connectivity ###
+  ### Test Gerrit server startup and sync ###
   test-gerrit:
-    name: "Test ${{ matrix.server.name }}"
+    name: "Startup/Sync: ${{ matrix.server.name }}"
     runs-on: ubuntu-latest
     needs: prepare
     permissions:
@@ -178,17 +211,129 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+  ### Test persistent Gerrit container (ONAP) ###
+  test-gerrit-persist:
+    name: "Persist: ONAP Gerrit"
+    runs-on: ubuntu-latest
+    needs: [validate, prepare]
+    if: needs.validate.outputs.persist_minutes != '0'
+    permissions:
+      contents: read
+    timeout-minutes: 180
+    steps:
+      # Harden the runner used by this workflow
+      # yamllint disable-line rule:line-length
+      - uses: step-security/harden-runner@20cf305ff2072d973412fa9b1e3a4f227bda3c76 # v2.14.0
+        with:
+          egress-policy: audit
+
+      - name: "Checkout repository"
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+
+      - name: "Lookup ONAP credentials"
+        id: credentials
+        env:
+          GERRIT_CREDENTIALS_B64: ${{ secrets.GERRIT_CREDENTIALS }}
+        run: |
+          # Lookup ONAP credentials from the base64-encoded secret
+          if [ -z "$GERRIT_CREDENTIALS_B64" ]; then
+            echo "::error::GERRIT_CREDENTIALS secret is not set"
+            exit 1
+          fi
+
+          GERRIT_CREDENTIALS=$(echo "$GERRIT_CREDENTIALS_B64" \
+            | base64 -d 2>/dev/null)
+          if [ -z "$GERRIT_CREDENTIALS" ]; then
+            echo "::error::Failed to decode GERRIT_CREDENTIALS"
+            echo "::error::Invalid base64 content/encoding"
+            exit 1
+          fi
+
+          CREDS=$(echo "$GERRIT_CREDENTIALS" \
+            | jq -r '.[] | select(.slug == "onap")')
+          if [ -z "$CREDS" ]; then
+            echo "::error::No credentials found for slug: onap"
+            exit 1
+          fi
+
+          USERNAME=$(echo "$CREDS" | jq -r '.username')
+          PASSWORD=$(echo "$CREDS" | jq -r '.password')
+          echo "::add-mask::$PASSWORD"
+          echo "username=$USERNAME" >> "$GITHUB_OUTPUT"
+          echo "password=$PASSWORD" >> "$GITHUB_OUTPUT"
+
+      - name: "Start ONAP Gerrit mirror"
+        id: gerrit
+        # yamllint disable-line rule:line-length
+        uses: modeseven-lfreleng-actions/gerrit-action@update-action  # Testing
+        with:
+          gerrit_setup: |
+            [{
+              "project": "",
+              "slug": "onap",
+              "gerrit": "gerrit.onap.org",
+              "api_path": "/r"
+            }]
+          auth_type: http_basic
+          http_username: ${{ steps.credentials.outputs.username }}
+          http_password: ${{ steps.credentials.outputs.password }}
+          sync_on_startup: ${{ inputs.sync_on_startup || 'false' }}
+          debug: ${{ inputs.debug || 'false' }}
+          check_service: true
+          exit: false
+
+      - name: "Use Gerrit: Placeholder work"
+        env:
+          PERSIST_MINUTES: ${{ needs.validate.outputs.persist_minutes }}
+          CONTAINER_IDS: ${{ steps.gerrit.outputs.container_ids }}
+          GERRIT_URLS: ${{ steps.gerrit.outputs.gerrit_urls }}
+          API_PATHS: ${{ steps.gerrit.outputs.api_paths }}
+        run: |
+          # Placeholder: Use Gerrit container for additional work
+          echo "ONAP Gerrit container is available"
+          echo "Container IDs: $CONTAINER_IDS"
+          echo "Gerrit URLs: $GERRIT_URLS"
+          echo ""
+          echo "TODO: Add API queries, clone repos, raise/merge changes here"
+          echo ""
+          echo "Persisting for ${PERSIST_MINUTES} minutes..."
+          sleep $((PERSIST_MINUTES * 60))
+          echo "Placeholder work complete"
+
+      - name: "Wait before cleanup"
+        run: |
+          # Wait 5 minutes before cleanup
+          echo "Waiting 5 minutes before cleanup..."
+          sleep 300
+          echo "Wait complete"
+
+      - name: "Cleanup ONAP Gerrit container"
+        if: always()
+        env:
+          CONTAINER_IDS: ${{ steps.gerrit.outputs.container_ids }}
+        run: |
+          # Cleanup Gerrit containers
+          if [ -n "$CONTAINER_IDS" ]; then
+            for cid in $(echo "$CONTAINER_IDS" | jq -r '.[]'); do
+              echo "Stopping container: $cid"
+              docker kill "$cid" 2>/dev/null || echo "Container already stopped"
+            done
+            echo "ONAP Gerrit container cleanup completed ✅"
+          fi
+
   ### Summary job ###
   summary:
     name: "Test Summary"
     runs-on: ubuntu-latest
     timeout-minutes: 3
-    needs: [prepare, test-gerrit]
+    needs: [validate, prepare, test-gerrit, test-gerrit-persist]
     if: always()
     permissions:
       contents: read
     steps:
       - name: "Generate summary"
+        env:
+          PERSIST_MINUTES: ${{ needs.validate.outputs.persist_minutes }}
         run: |
           # Generate test summary
           {
@@ -196,8 +341,13 @@ jobs:
             echo ""
             echo "| Status | Details |"
             echo "|--------|---------|"
+            echo "| Validation | ${{ needs.validate.result }} |"
             echo "| Preparation | ${{ needs.prepare.result }} |"
-            echo "| Gerrit Tests | ${{ needs.test-gerrit.result }} |"
+            echo "| Startup/Sync Tests | ${{ needs.test-gerrit.result }} |"
+            if [ "$PERSIST_MINUTES" != "0" ]; then
+              echo "| Persist Test (ONAP) \
+                | ${{ needs.test-gerrit-persist.result }} |"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: "Check overall result"
