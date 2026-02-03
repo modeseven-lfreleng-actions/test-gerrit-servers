@@ -178,7 +178,7 @@ jobs:
       - name: "Test Gerrit server: ${{ matrix.server.gerrit }}"
         id: gerrit
         # yamllint disable-line rule:line-length
-        uses: modeseven-lfreleng-actions/gerrit-action@update-action  # Testing
+        uses: modeseven-lfreleng-actions/gerrit-action@refactor-replication  # Testing
         with:
           gerrit_setup: |
             [{
@@ -265,7 +265,7 @@ jobs:
       - name: "Start ONAP Gerrit mirror"
         id: gerrit
         # yamllint disable-line rule:line-length
-        uses: modeseven-lfreleng-actions/gerrit-action@update-action  # Testing
+        uses: modeseven-lfreleng-actions/gerrit-action@refactor-replication  # Testing
         with:
           gerrit_setup: |
             [{

@@ -22,7 +22,7 @@ on:
       sync_on_startup:
         description: "Trigger replication after startup"
         required: false
-        default: "false"
+        default: "true"
         type: choice
         options:
           - "true"
@@ -95,9 +95,11 @@ jobs:
           fi
 
           # Extract server details
+          # shellcheck disable=SC2129
           echo "name=$(echo "$SERVER" | jq -r '.name')" >> "$GITHUB_OUTPUT"
           echo "gerrit=$(echo "$SERVER" | jq -r '.gerrit')" >> "$GITHUB_OUTPUT"
-          echo "api_path=$(echo "$SERVER" | jq -r '.api_path')" >> "$GITHUB_OUTPUT"
+          API_PATH=$(echo "$SERVER" | jq -r '.api_path')
+          echo "api_path=$API_PATH" >> "$GITHUB_OUTPUT"
           PROJECT_FILTER=$(echo "$SERVER" | jq -r '.project_filter // ""')
           echo "project_filter=$PROJECT_FILTER" >> "$GITHUB_OUTPUT"
 
@@ -140,7 +142,7 @@ jobs:
       - name: "Start Gerrit mirror"
         id: gerrit
         # yamllint disable-line rule:line-length
-        uses: modeseven-lfreleng-actions/gerrit-action@update-action  # Testing
+        uses: modeseven-lfreleng-actions/gerrit-action@refactor-replication
         with:
           gerrit_setup: |
             [{
@@ -152,6 +154,7 @@ jobs:
           auth_type: http_basic
           http_username: ${{ steps.credentials.outputs.username }}
           http_password: ${{ steps.credentials.outputs.password }}
+          ssh_auth_keys: ${{ vars.GERRIT_PUBLIC_KEYS }}
           sync_on_startup: ${{ inputs.sync_on_startup }}
           debug: "true"
           check_service: true
@@ -238,7 +241,8 @@ jobs:
               echo ""
               echo "Example API call:"
               echo '```bash'
-              echo "curl -s http://bore.pub:$HTTP_PORT${API_PATH}/config/server/version"
+              API_URL="http://bore.pub:$HTTP_PORT${API_PATH}"
+              echo "curl -s ${API_URL}/config/server/version"
               echo '```'
               echo ""
             else
@@ -250,11 +254,17 @@ jobs:
               echo '```'
               echo "Host: bore.pub"
               echo "Port: $SSH_PORT"
+              echo "Username: admin"
+              echo '```'
+              echo ""
+              echo "Example SSH connection:"
+              echo '```bash'
+              echo "ssh -p $SSH_PORT admin@bore.pub gerrit version"
               echo '```'
               echo ""
               echo "Example git clone:"
               echo '```bash'
-              echo "git clone ssh://YOUR_USERNAME@bore.pub:$SSH_PORT/REPO_NAME"
+              echo "git clone ssh://admin@bore.pub:$SSH_PORT/REPO_NAME"
               echo '```'
               echo ""
             else
@@ -264,9 +274,10 @@ jobs:
             echo "## Session Info"
             echo ""
             echo "- **Duration**: $DEBUG_MINUTES minutes"
-            echo "- **Expires**: approximately $(date -d "+$DEBUG_MINUTES minutes" \
-              '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null || \
-              date -v+${DEBUG_MINUTES}M '+%Y-%m-%d %H:%M:%S %Z')"
+            DATE_FMT='+%Y-%m-%d %H:%M:%S %Z'
+            EXPIRY=$(date -d "+$DEBUG_MINUTES minutes" "$DATE_FMT" \
+              2>/dev/null || date -v+"${DEBUG_MINUTES}"M "$DATE_FMT")
+            echo "- **Expires**: approximately $EXPIRY"
             echo ""
             echo "⚠️ **Security Note**: These URLs are publicly accessible!"
             echo "The tunnels will close automatically when the job ends."
@@ -281,7 +292,7 @@ jobs:
             echo "HTTP: http://bore.pub:$HTTP_PORT$API_PATH"
           fi
           if [ -n "$SSH_PORT" ]; then
-            echo "SSH:  ssh -p $SSH_PORT bore.pub"
+            echo "SSH:  ssh -p $SSH_PORT admin@bore.pub"
           fi
           echo "Duration: $DEBUG_MINUTES minutes"
           echo "============================================"
@@ -332,10 +343,11 @@ jobs:
 
           # Stop Gerrit containers
           if [ -n "$CONTAINER_IDS" ]; then
-            for cid in $(echo "$CONTAINER_IDS" | jq -r '.[]' 2>/dev/null); do
+            while IFS= read -r cid; do
+              [ -z "$cid" ] && continue
               echo "Stopping container: $cid"
               docker kill "$cid" 2>/dev/null || true
-            done
+            done < <(echo "$CONTAINER_IDS" | jq -r '.[]' 2>/dev/null)
           fi
 
           echo "Cleanup complete ✅"
