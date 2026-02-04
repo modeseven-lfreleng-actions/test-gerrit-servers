@@ -2,23 +2,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 The Linux Foundation
 
-# Debug Gerrit with remote access via bore tunnel
+# Debug Gerrit Deployment with Optional External Tunnel Access
 #
-# This workflow starts bore tunnels BEFORE the Gerrit container, allowing
-# the container to be configured with the correct public URLs from the start.
-# This eliminates the fragile config-patch-and-restart sequence that was
-# previously required.
+# This workflow starts a Gerrit container for debugging/testing, with optional
+# external tunnel access for remote connectivity.
 #
-# How it works:
-# 1. Calculate deterministic local ports based on instance index
-# 2. Start bore tunnels pointing to those ports (bore doesn't require
-#    the local port to be listening - it connects on-demand)
-# 3. Extract the assigned public ports from bore
-# 4. Pass tunnel config to gerrit-action, which configures Gerrit with
-#    the public URLs from the start
-# 5. No container restart needed!
+# When tunnels are enabled (default), the workflow:
+#   1. Sets up the tunnel (currently using Bore)
+#   2. Extracts the assigned public host/ports
+#   3. Passes tunnel config to gerrit-action for public URL configuration
+#
+# When tunnels are disabled, Gerrit runs with localhost access only.
 
-name: "Debug Gerrit (bore tunnel) 🔧"
+name: "Debug Gerrit Deployment 🔧"
 
 # yamllint disable-line rule:truthy
 on:
@@ -51,6 +47,11 @@ on:
         options:
           - "true"
           - "false"
+      enable_tunnel:
+        description: "Enable tunnel for remote access"
+        required: false
+        default: true
+        type: boolean
 
 concurrency:
   group: "${{ github.workflow }}-${{ github.ref }}"
@@ -60,7 +61,7 @@ permissions: {}
 
 jobs:
   debug-gerrit:
-    name: "Debug Gerrit via bore tunnel"
+    name: "Debug Gerrit Deployment"
     runs-on: ubuntu-latest
     timeout-minutes: 65
     permissions:
@@ -68,7 +69,7 @@ jobs:
     steps:
       # Harden the runner
       # yamllint disable-line rule:line-length
-      - uses: step-security/harden-runner@20cf305ff2072d973412fa9b1e3a4f227bda3c76 # v2.14.0
+      - uses: step-security/harden-runner@e3f713f2d8f53843e71c69a996d56f51aa9adfb9  # v2.14.1
         with:
           egress-policy: audit
 
@@ -94,7 +95,8 @@ jobs:
           echo "Validated debug_minutes: $DEBUG_MINUTES"
 
       - name: "Checkout repository"
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
       - name: "Lookup server config"
         id: server
@@ -164,20 +166,23 @@ jobs:
           echo "password=$PASSWORD" >> "$GITHUB_OUTPUT"
 
       # ================================================================
-      # TUNNEL SETUP - BEFORE GERRIT
+      # TUNNEL SETUP (optional, before Gerrit)
       # ================================================================
-      # We start bore tunnels BEFORE Gerrit so we know the public ports
-      # before the container starts. This allows Gerrit to be configured
-      # with the correct canonicalWebUrl and sshd.advertisedAddress from
-      # the beginning, eliminating the need for container restart.
+      # External tunnel access allows remote connectivity to the Gerrit
+      # container running on the GitHub Actions runner.
       #
-      # Key insight: bore doesn't require the local port to be listening
-      # when the tunnel is established. It only connects to localhost
-      # when an actual incoming connection arrives (lazy/on-demand).
+      # The tunnel setup produces:
+      #   - tunnel_host: The public hostname/IP for access
+      #   - tunnel_ports: JSON mapping of slug to {http, ssh} ports
+      #
+      # Currently using Bore (bore.pub) for public TCP tunnels.
+      # Bore tunnels connect on-demand, so they can be started before
+      # the local ports are listening. No authentication required.
       # ================================================================
 
       - name: "Calculate local ports"
         id: ports
+        if: inputs.enable_tunnel
         run: |
           # Calculate deterministic local ports
           # These match what gerrit-action will use (BASE_PORT + index)
@@ -198,7 +203,9 @@ jobs:
           echo "  HTTP: $HTTP_PORT"
           echo "  SSH:  $SSH_PORT"
 
+      # Bore: Install tunnel client
       - name: "Install bore"
+        if: inputs.enable_tunnel
         run: |
           # Install bore TCP tunnel client
           BORE_VERSION="0.5.2"
@@ -213,8 +220,10 @@ jobs:
           sudo mv bore /usr/local/bin/
           echo "bore installed successfully ✅"
 
+      # Bore: Start tunnels to bore.pub
       - name: "Start bore tunnels"
         id: tunnels
+        if: inputs.enable_tunnel
         env:
           LOCAL_HTTP: ${{ steps.ports.outputs.http_port }}
           LOCAL_SSH: ${{ steps.ports.outputs.ssh_port }}
@@ -240,17 +249,58 @@ jobs:
             echo "local_ssh_port=$LOCAL_SSH"
           } >> "$GITHUB_OUTPUT"
 
-          # Wait for tunnels to establish
+          # Wait for tunnels to establish (with timeout)
           echo "Waiting for tunnels to establish..."
-          sleep 10
+          MAX_WAIT=30
+          WAIT_INTERVAL=2
+          ELAPSED=0
 
-          # Extract assigned ports from logs
+          while [ $ELAPSED -lt $MAX_WAIT ]; do
+            sleep $WAIT_INTERVAL
+            ELAPSED=$((ELAPSED + WAIT_INTERVAL))
+
+            # Check if bore processes are still running
+            HTTP_RUNNING=true
+            SSH_RUNNING=true
+            if ! kill -0 "$HTTP_PID" 2>/dev/null; then
+              HTTP_RUNNING=false
+            fi
+            if ! kill -0 "$SSH_PID" 2>/dev/null; then
+              SSH_RUNNING=false
+            fi
+
+            # Check for success in logs
+            HTTP_PORT=$(grep -oP 'listening at bore\.pub:\K\d+' \
+              bore-http.log 2>/dev/null || echo "")
+            SSH_PORT=$(grep -oP 'listening at bore\.pub:\K\d+' \
+              bore-ssh.log 2>/dev/null || echo "")
+
+            # If both tunnels have ports, we're done
+            if [ -n "$HTTP_PORT" ] && [ -n "$SSH_PORT" ]; then
+              echo "Tunnels established after ${ELAPSED}s"
+              break
+            fi
+
+            # If a process died without getting a port, fail early
+            if [ "$HTTP_RUNNING" = "false" ] && [ -z "$HTTP_PORT" ]; then
+              echo "HTTP tunnel process exited unexpectedly"
+              break
+            fi
+            if [ "$SSH_RUNNING" = "false" ] && [ -z "$SSH_PORT" ]; then
+              echo "SSH tunnel process exited unexpectedly"
+              break
+            fi
+
+            echo "  Waiting... (${ELAPSED}s/${MAX_WAIT}s)"
+          done
+
+          # Final port extraction
           HTTP_PORT=$(grep -oP 'listening at bore\.pub:\K\d+' \
-            bore-http.log || echo "")
+            bore-http.log 2>/dev/null || echo "")
           SSH_PORT=$(grep -oP 'listening at bore\.pub:\K\d+' \
-            bore-ssh.log || echo "")
+            bore-ssh.log 2>/dev/null || echo "")
 
-          # Determine if tunnels succeeded and set appropriate host/ports
+          # Determine if tunnels succeeded
           if [ -n "$HTTP_PORT" ] && [ -n "$SSH_PORT" ]; then
             # Build tunnel_ports JSON for gerrit-action
             TUNNEL_PORTS=$(jq -n \
@@ -273,32 +323,42 @@ jobs:
             echo ""
             echo "Tunnel ports JSON: $TUNNEL_PORTS"
           else
-            echo "::warning::Bore tunnels failed - falling back to localhost"
-            {
-              echo "tunnels_ok=false"
-              echo "bore_host=localhost"
-              echo "http_port=$LOCAL_HTTP"
-              echo "ssh_port=$LOCAL_SSH"
-              echo "tunnel_ports="
-            } >> "$GITHUB_OUTPUT"
+            # Tunnel setup failed - fatal error
+            # Extract first line of error (remove newlines)
+            HTTP_ERR=$(head -1 bore-http.log 2>/dev/null || echo "unknown")
+            SSH_ERR=$(head -1 bore-ssh.log 2>/dev/null || echo "unknown")
 
-            if [ -z "$HTTP_PORT" ]; then
-              echo "HTTP tunnel failed:"
-              cat bore-http.log
+            echo ""
+            echo "❌ Bore tunnel setup failed"
+            # Show single error if both are identical (e.g., control port down)
+            if [ "$HTTP_ERR" = "$SSH_ERR" ]; then
+              echo "  Error: $HTTP_ERR"
+            else
+              [ -z "$HTTP_PORT" ] && echo "  HTTP: $HTTP_ERR"
+              [ -z "$SSH_PORT" ] && echo "  SSH: $SSH_ERR"
             fi
-            if [ -z "$SSH_PORT" ]; then
-              echo "SSH tunnel failed:"
-              cat bore-ssh.log
-            fi
+            echo ""
+
+            # Write GitHub Job Summary
+            {
+              echo "## ❌ Bore Tunnel Setup Failed"
+              echo ""
+              if [ "$HTTP_ERR" = "$SSH_ERR" ]; then
+                echo "$HTTP_ERR"
+              else
+                [ -z "$HTTP_PORT" ] && echo "- **HTTP:** $HTTP_ERR"
+                [ -z "$SSH_PORT" ] && echo "- **SSH:** $SSH_ERR"
+              fi
+              echo ""
+              echo "bore.pub may be down, or port 7835 is blocked."
+            } >> "$GITHUB_STEP_SUMMARY"
+
+            echo "::error::Bore tunnel setup failed. Check job summary."
+            exit 1
           fi
 
       # ================================================================
-      # START GERRIT WITH TUNNEL URLS
-      # ================================================================
-      # Now we start Gerrit with the tunnel configuration passed in.
-      # The action will configure canonicalWebUrl, sshd.advertisedAddress,
-      # etc. with the public tunnel URLs from the start.
-      # NO CONTAINER RESTART REQUIRED!
+      # START GERRIT
       # ================================================================
 
       - name: "Start Gerrit mirror"
@@ -317,18 +377,19 @@ jobs:
           http_username: ${{ steps.credentials.outputs.username }}
           http_password: ${{ steps.credentials.outputs.password }}
           ssh_auth_keys: ${{ vars.GERRIT_PUBLIC_KEYS }}
+          ssh_auth_username: 'modesevenindustrialsolutions'
           sync_on_startup: ${{ inputs.sync_on_startup }}
           use_api_path: ${{ inputs.use_api_path }}
           debug: "true"
           check_service: true
           exit: false
           # Pass tunnel config - Gerrit uses these URLs from the start
-          # yamllint disable-line rule:line-length
-          tunnel_host: ${{ steps.tunnels.outputs.tunnels_ok == 'true' && 'bore.pub' || '' }}
+          # (tunnels are guaranteed to be working if we reach this step)
+          tunnel_host: ${{ inputs.enable_tunnel && 'bore.pub' || '' }}
           tunnel_ports: ${{ steps.tunnels.outputs.tunnel_ports }}
 
       - name: "Verify tunnel connectivity"
-        if: steps.tunnels.outputs.tunnels_ok == 'true'
+        if: inputs.enable_tunnel
         env:
           BORE_HOST: ${{ steps.tunnels.outputs.bore_host }}
           HTTP_PORT: ${{ steps.tunnels.outputs.http_port }}
@@ -371,19 +432,34 @@ jobs:
 
       - name: "Display connection info"
         env:
-          BORE_HOST: ${{ steps.tunnels.outputs.bore_host }}
-          HTTP_PORT: ${{ steps.tunnels.outputs.http_port }}
-          SSH_PORT: ${{ steps.tunnels.outputs.ssh_port }}
-          LOCAL_HTTP: ${{ steps.tunnels.outputs.local_http_port }}
-          LOCAL_SSH: ${{ steps.tunnels.outputs.local_ssh_port }}
+          USE_BORE: ${{ inputs.enable_tunnel }}
+          TUNNEL_BORE_HOST: ${{ steps.tunnels.outputs.bore_host }}
+          TUNNEL_HTTP_PORT: ${{ steps.tunnels.outputs.http_port }}
+          TUNNEL_SSH_PORT: ${{ steps.tunnels.outputs.ssh_port }}
+          TUNNEL_LOCAL_HTTP: ${{ steps.tunnels.outputs.local_http_port }}
+          TUNNEL_LOCAL_SSH: ${{ steps.tunnels.outputs.local_ssh_port }}
           DEBUG_MINUTES: ${{ steps.validate.outputs.debug_minutes }}
           SERVER_NAME: ${{ steps.server.outputs.name }}
           API_PATH: ${{ steps.server.outputs.api_path }}
           SERVER_SLUG: ${{ inputs.server_slug }}
           USE_API_PATH: ${{ inputs.use_api_path }}
-          TUNNELS_OK: ${{ steps.tunnels.outputs.tunnels_ok }}
         run: |
           # Display connection information
+          # Set connection variables based on tunnel usage
+          if [ "$USE_BORE" = "true" ]; then
+            BORE_HOST="$TUNNEL_BORE_HOST"
+            HTTP_PORT="$TUNNEL_HTTP_PORT"
+            SSH_PORT="$TUNNEL_SSH_PORT"
+            LOCAL_HTTP="$TUNNEL_LOCAL_HTTP"
+            LOCAL_SSH="$TUNNEL_LOCAL_SSH"
+          else
+            BORE_HOST="localhost"
+            HTTP_PORT="8080"
+            SSH_PORT="29418"
+            LOCAL_HTTP="8080"
+            LOCAL_SSH="29418"
+          fi
+
           # Build tunnel info array for iteration
           declare -a TUNNELS=()
 
@@ -393,7 +469,7 @@ jobs:
             EFFECTIVE_API_PATH="$API_PATH"
           fi
 
-          # Build tunnel info - BORE_HOST is bore.pub or localhost
+          # Build tunnel info - BORE_HOST is bore.pub (tunnels guaranteed)
           if [ -n "$HTTP_PORT" ]; then
             if [ -n "$EFFECTIVE_API_PATH" ]; then
               HTTP_URL="http://${BORE_HOST}:${HTTP_PORT}${EFFECTIVE_API_PATH}/"
@@ -405,11 +481,6 @@ jobs:
           if [ -n "$SSH_PORT" ]; then
             SSH_URL="ssh://admin@${BORE_HOST}:${SSH_PORT}"
             TUNNELS+=("ssh|SSH/Git|$LOCAL_SSH|$SSH_PORT|$SSH_URL")
-          fi
-
-          # Note access type
-          if [ "$TUNNELS_OK" != "true" ]; then
-            echo "::warning::Using localhost - not publicly accessible"
           fi
 
           {
@@ -424,16 +495,6 @@ jobs:
               IFS='|' read -r _ LABEL LOCAL PUBLIC URL <<< "$t"
               echo "| **$LABEL** | $LOCAL | $PUBLIC | \`$URL\` |"
             done
-
-            if [ ${#TUNNELS[@]} -eq 0 ]; then
-              echo "| ❌ No tunnels | - | - | - |"
-            fi
-
-            # Show access type notice
-            if [ "$TUNNELS_OK" != "true" ]; then
-              echo ""
-              echo "> ⚠️ **Local access only** - bore tunnels unavailable"
-            fi
 
             echo ""
             echo "## 🔗 Quick Access"
@@ -482,14 +543,15 @@ jobs:
             echo "|----------|-------|"
             echo "| Server | $SERVER_NAME (\`$SERVER_SLUG\`) |"
             echo "| Duration | $DEBUG_MINUTES minutes |"
-            echo "| Startup Mode | Tunnel-first (no restart) |"
             DATE_FMT='+%Y-%m-%d %H:%M:%S %Z'
             EXPIRY=$(date -d "+$DEBUG_MINUTES minutes" "$DATE_FMT" \
               2>/dev/null || date -v+"${DEBUG_MINUTES}"M "$DATE_FMT")
             echo "| Expires | $EXPIRY |"
             echo ""
-            if [ "$TUNNELS_OK" = "true" ]; then
+            if [ "$USE_BORE" = "true" ]; then
               echo "> ⚠️ **Warning**: URLs are publicly accessible!"
+            else
+              echo "> ℹ️ **Note**: Local access only (external tunnel disabled)"
             fi
             echo ""
           } >> "$GITHUB_STEP_SUMMARY"
@@ -504,13 +566,13 @@ jobs:
             printf "  %-10s %s\n" "$LABEL:" "$URL"
           done
           echo "  Duration:  $DEBUG_MINUTES minutes"
-          echo "  Mode:      Tunnel-first (no restart)"
           echo "========================================"
           echo ""
 
       - name: "Keep session alive"
         env:
           DEBUG_MINUTES: ${{ steps.validate.outputs.debug_minutes }}
+          USE_BORE: ${{ inputs.enable_tunnel }}
         run: |
           # Keep the session alive for the specified duration
           echo "Session will remain active for $DEBUG_MINUTES minutes..."
@@ -526,13 +588,15 @@ jobs:
             REMAINING=$(( (TOTAL_SECONDS - ELAPSED) / 60 ))
             echo "[$(date '+%H:%M:%S')] $REMAINING minutes remaining..."
 
-            # Check if tunnels are still running
-            if ! pgrep -f "bore local" > /dev/null; then
-              echo "::warning::bore tunnels have stopped unexpectedly"
-              echo "HTTP tunnel log:"
-              cat bore-http.log 2>/dev/null || echo "(no log)"
-              echo "SSH tunnel log:"
-              cat bore-ssh.log 2>/dev/null || echo "(no log)"
+            # Check if tunnels are still running (only when bore is enabled)
+            if [ "$USE_BORE" = "true" ]; then
+              if ! pgrep -f "bore local" > /dev/null; then
+                echo "::warning::bore tunnels have stopped unexpectedly"
+                echo "HTTP tunnel log:"
+                cat bore-http.log 2>/dev/null || echo "(no log)"
+                echo "SSH tunnel log:"
+                cat bore-ssh.log 2>/dev/null || echo "(no log)"
+              fi
             fi
 
             sleep $INTERVAL
@@ -545,12 +609,15 @@ jobs:
         if: always()
         env:
           CONTAINER_IDS: ${{ steps.gerrit.outputs.container_ids }}
+          USE_BORE: ${{ inputs.enable_tunnel }}
         run: |
           # Cleanup tunnels and containers
           echo "Cleaning up..."
 
-          # Stop bore tunnels
-          pkill -f "bore local" 2>/dev/null || true
+          # Stop bore tunnels (only when bore is enabled)
+          if [ "$USE_BORE" = "true" ]; then
+            pkill -f "bore local" 2>/dev/null || true
+          fi
 
           # Stop and remove Gerrit containers
           if [ -n "$CONTAINER_IDS" ]; then
