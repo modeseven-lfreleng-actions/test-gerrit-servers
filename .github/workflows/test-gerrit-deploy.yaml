@@ -3,7 +3,7 @@
 # SPDX-FileCopyrightText: 2025 The Linux Foundation
 
 # Test Gerrit server connectivity workflow
-name: "Test Gerrit Servers 🔗"
+name: "Test Deploy Gerrit 🔗"
 
 # yamllint disable-line rule:truthy
 on:
@@ -66,11 +66,17 @@ jobs:
       contents: read
     outputs:
       debug_minutes: ${{ steps.validate.outputs.debug_minutes }}
+      effective_debug: ${{ steps.validate.outputs.effective_debug }}
     steps:
       - name: "Validate debug_minutes"
         id: validate
         env:
           DEBUG_MINUTES: ${{ inputs.debug_minutes || 15 }}
+          DEBUG_INPUT: ${{ inputs.debug || 'false' }}
+          # RUNNER_DEBUG is set to '1' when re-running with debug logging
+          RUNNER_DEBUG: ${{ runner.debug }}
+          # ACTIONS_STEP_DEBUG is 'true' when step debug logging is enabled
+          ACTIONS_STEP_DEBUG: ${{ secrets.ACTIONS_STEP_DEBUG }}
         run: |
           # Validate debug_minutes input
           if ! [[ "$DEBUG_MINUTES" =~ ^[0-9]+$ ]]; then
@@ -87,6 +93,26 @@ jobs:
           fi
           echo "debug_minutes=$DEBUG_MINUTES" >> "$GITHUB_OUTPUT"
           echo "Validated debug_minutes: $DEBUG_MINUTES"
+
+          # Compute effective debug: true if input OR runner debug is enabled
+          # GitHub sets RUNNER_DEBUG=1 and/or ACTIONS_STEP_DEBUG=true when
+          # re-running with debug logging enabled
+          if [ "$DEBUG_INPUT" = "true" ] || [ "$RUNNER_DEBUG" = "1" ] || \
+             [ "$ACTIONS_STEP_DEBUG" = "true" ]; then
+            EFFECTIVE_DEBUG="true"
+            if [ "$RUNNER_DEBUG" = "1" ] || \
+               [ "$ACTIONS_STEP_DEBUG" = "true" ]; then
+              echo "Debug enabled via GitHub 'Re-run with debug logging'"
+              echo "  RUNNER_DEBUG=$RUNNER_DEBUG"
+              echo "  ACTIONS_STEP_DEBUG=$ACTIONS_STEP_DEBUG"
+            else
+              echo "Debug enabled via workflow input"
+            fi
+          else
+            EFFECTIVE_DEBUG="false"
+          fi
+          echo "effective_debug=$EFFECTIVE_DEBUG" >> "$GITHUB_OUTPUT"
+          echo "Effective debug: $EFFECTIVE_DEBUG"
 
   ### Extract non-sensitive matrix data ###
   prepare:
@@ -159,7 +185,7 @@ jobs:
   sync-test:
     name: "${{ matrix.server.name }}"
     runs-on: ubuntu-latest
-    needs: prepare
+    needs: [validate, prepare]
     permissions:
       contents: read
     timeout-minutes: 15
@@ -240,7 +266,7 @@ jobs:
           http_username: ${{ steps.credentials.outputs.username }}
           http_password: ${{ steps.credentials.outputs.password }}
           sync_on_startup: ${{ inputs.sync_on_startup || 'false' }}
-          debug: ${{ inputs.debug || 'false' }}
+          debug: ${{ needs.validate.outputs.effective_debug }}
           check_service: true
           exit: true
 
@@ -515,7 +541,7 @@ jobs:
           ssh_auth_username: 'modesevenindustrialsolutions'
           sync_on_startup: ${{ inputs.sync_on_startup }}
           use_api_path: ${{ inputs.use_api_path }}
-          debug: "true"
+          debug: ${{ needs.validate.outputs.effective_debug }}
           check_service: true
           exit: false
           tunnel_host: ${{ inputs.enable_tunnel && 'bore.pub' || '' }}
