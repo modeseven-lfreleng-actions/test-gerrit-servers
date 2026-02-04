@@ -26,9 +26,9 @@ on:
           - "true"
           - "false"
       slug_filter:
-        description: "Server slug filter (empty = all servers)"
+        description: "Server slug filter ('all' = all servers)"
         required: false
-        default: "onap"
+        default: "all"
         type: string
       debug_minutes:
         description: "Minutes to keep debug session open (max 60)"
@@ -133,8 +133,8 @@ jobs:
           echo "Full matrix prepared with $COUNT Gerrit servers"
 
           # Output filtered matrix for debug tests
-          if [ -z "$SLUG_FILTER" ]; then
-            # Empty filter = all servers
+          if [ -z "$SLUG_FILTER" ] || [ "$SLUG_FILTER" = "all" ]; then
+            # Empty filter or "all" = all servers
             DEBUG_MATRIX="$MATRIX"
             echo "Debug matrix: all $COUNT servers (no filter)"
           else
@@ -261,8 +261,8 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   ### Debug Gerrit Deployment with Optional Tunnel Access ###
-  debug-gerrit:
-    name: "Debug: ${{ matrix.server.name }}"
+  persist-gerrit:
+    name: "Persist: ${{ matrix.server.name }}"
     runs-on: ubuntu-latest
     needs: [validate, prepare]
     if: needs.validate.outputs.debug_minutes != '0'
@@ -759,7 +759,7 @@ jobs:
     name: "Test Summary"
     runs-on: ubuntu-latest
     timeout-minutes: 3
-    needs: [validate, prepare, sync-test, debug-gerrit]
+    needs: [validate, prepare, sync-test, persist-gerrit]
     if: always()
     permissions:
       contents: read
@@ -780,7 +780,7 @@ jobs:
             echo "| Sync Tests | ${{ needs.sync-test.result }} |"
             if [ "$DEBUG_MINUTES" != "0" ]; then
               echo "| Debug Sessions ($DEBUG_COUNT) \
-                | ${{ needs.debug-gerrit.result }} |"
+                | ${{ needs.persist-gerrit.result }} |"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
