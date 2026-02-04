@@ -49,6 +49,11 @@ on:
         required: false
         default: true
         type: boolean
+      resync_orgs:
+        description: "Resync GitHub orgs with Gerrit content (reset + mirror)"
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: "${{ github.workflow }}-${{ github.ref }}"
@@ -780,12 +785,178 @@ jobs:
 
           echo "Cleanup complete ✅"
 
+  ### Resync GitHub Organizations with Gerrit Content ###
+  resync-orgs-prepare:
+    name: "Prepare resync matrix"
+    runs-on: ubuntu-latest
+    needs: [validate, prepare]
+    if: ${{ inputs.resync_orgs == true }}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      matrix: ${{ steps.build-matrix.outputs.matrix }}
+    steps:
+      # Harden the runner
+      # yamllint disable-line rule:line-length
+      - uses: step-security/harden-runner@e3f713f2d8f53843e71c69a996d56f51aa9adfb9  # v2.14.1
+        with:
+          egress-policy: audit
+
+      - name: "Build resync matrix from GERRIT_SERVERS"
+        id: build-matrix
+        env:
+          GERRIT_SERVERS: ${{ vars.GERRIT_SERVERS }}
+        run: |
+          # Build matrix with all github orgs (github_org and github_gerrit_org)
+          # Each entry maps a GitHub org to its source Gerrit server
+          if [ -z "$GERRIT_SERVERS" ]; then
+            echo "::error::GERRIT_SERVERS variable is not set"
+            exit 1
+          fi
+
+          # Validate JSON
+          if ! echo "$GERRIT_SERVERS" | jq empty 2>/dev/null; then
+            echo "::error::GERRIT_SERVERS is not valid JSON"
+            exit 1
+          fi
+
+          # Build matrix: for each server, create entries for both github_org
+          # and github_gerrit_org
+          MATRIX=$(echo "$GERRIT_SERVERS" | jq -c '
+            [.[] |
+              {
+                github_org: .github_org,
+                gerrit: .gerrit,
+                api_path: .api_path,
+                name: .name,
+                slug: .slug
+              },
+              {
+                github_org: .github_gerrit_org,
+                gerrit: .gerrit,
+                api_path: .api_path,
+                name: .name,
+                slug: .slug
+              }
+            ]
+          ')
+
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+          COUNT=$(echo "$MATRIX" | jq '. | length')
+          echo "Resync matrix prepared with $COUNT GitHub organizations"
+          echo "$MATRIX" | jq '.'
+
+  resync-orgs:
+    name: "Resync: ${{ matrix.org.github_org }}"
+    runs-on: ubuntu-latest
+    needs: [validate, resync-orgs-prepare]
+    if: ${{ inputs.resync_orgs == true }}
+    permissions:
+      contents: read
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        org: ${{ fromJSON(needs.resync-orgs-prepare.outputs.matrix) }}
+    steps:
+      # Harden the runner
+      # yamllint disable-line rule:line-length
+      - uses: step-security/harden-runner@e3f713f2d8f53843e71c69a996d56f51aa9adfb9  # v2.14.1
+        with:
+          egress-policy: audit
+
+      - name: "Install gerrit-clone CLI"
+        run: |
+          # Install uv if not available
+          if ! command -v uv &> /dev/null; then
+            echo "Installing uv..."
+            curl -LsSf https://astral.sh/uv/install.sh | sh
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+
+          # Create wrapper for gerrit-clone
+          mkdir -p "$HOME/.local/bin"
+          cat > "$HOME/.local/bin/gerrit-clone" << 'WRAPPER'
+          #!/bin/bash
+          exec uvx gerrit-clone "$@"
+          WRAPPER
+          chmod +x "$HOME/.local/bin/gerrit-clone"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.local/bin:$PATH"
+
+          # Verify installation
+          gerrit-clone --version
+
+      - name: "Reset GitHub org: ${{ matrix.org.github_org }}"
+        env:
+          GITHUB_TOKEN: ${{ secrets.ORG_ADMIN_TOKEN }}
+          GITHUB_ORG: ${{ matrix.org.github_org }}
+        run: |
+          # Forcibly remove all repositories from the GitHub organization
+          echo "Resetting GitHub organization: $GITHUB_ORG"
+          echo "WARNING: This will delete ALL repositories in $GITHUB_ORG"
+
+          gerrit-clone reset \
+            --org "$GITHUB_ORG" \
+            --no-confirm \
+            --verbose
+
+          echo "Reset complete for $GITHUB_ORG"
+
+      - name: "Mirror Gerrit to GitHub: ${{ matrix.org.github_org }}"
+        env:
+          GITHUB_TOKEN: ${{ secrets.ORG_ADMIN_TOKEN }}
+          GITHUB_ORG: ${{ matrix.org.github_org }}
+          GERRIT_SERVER: ${{ matrix.org.gerrit }}
+        run: |
+          # Mirror all Gerrit content to the GitHub organization
+          echo "Mirroring from $GERRIT_SERVER to $GITHUB_ORG"
+
+          gerrit-clone mirror \
+            --server "$GERRIT_SERVER" \
+            --org "$GITHUB_ORG" \
+            --output-path "/tmp/mirror-${GITHUB_ORG}" \
+            --discovery-method http \
+            --https \
+            --recreate \
+            --overwrite \
+            --verbose
+
+          echo "Mirror complete for $GITHUB_ORG"
+
+      - name: "Report results"
+        if: always()
+        env:
+          GITHUB_ORG: ${{ matrix.org.github_org }}
+          GERRIT_SERVER: ${{ matrix.org.gerrit }}
+        run: |
+          {
+            echo "## Resync: $GITHUB_ORG"
+            echo ""
+            echo "| Property | Value |"
+            echo "|----------|-------|"
+            echo "| GitHub Org | \`$GITHUB_ORG\` |"
+            echo "| Gerrit Server | \`$GERRIT_SERVER\` |"
+            echo "| Status | ${{ job.status }} |"
+            echo ""
+            if [ -f "/tmp/mirror-${GITHUB_ORG}/mirror-manifest.json" ]; then
+              echo "### Mirror Results"
+              echo '```json'
+              jq '{total, succeeded, failed, skipped, duration_s}' \
+                "/tmp/mirror-${GITHUB_ORG}/mirror-manifest.json"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+
   ### Summary job ###
   summary:
     name: "Test Summary"
     runs-on: ubuntu-latest
     timeout-minutes: 3
-    needs: [validate, prepare, sync-test, persist-gerrit]
+    needs: [validate, prepare, sync-test, persist-gerrit, resync-orgs]
     if: always()
     permissions:
       contents: read
