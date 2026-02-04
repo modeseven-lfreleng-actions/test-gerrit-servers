@@ -25,8 +25,9 @@ on:
         options:
           - "true"
           - "false"
-      slug_filter:
-        description: "Server slug filter ('all' = all servers)"
+      slug_selector:
+        # Supports: 'all', single value, comma/space-separated, wildcards (*,?)
+        description: "Server slug selector"
         required: false
         default: "all"
         type: string
@@ -50,10 +51,16 @@ on:
         default: true
         type: boolean
       resync_orgs:
-        description: "Resync GitHub orgs with Gerrit content (reset + mirror)"
+        description: "Resync GitHub ORGs with Gerrit"
         required: false
         default: false
         type: boolean
+      github_selector:
+        # Supports: 'all', single value, comma/space-separated, wildcards (*,?)
+        description: "GitHub org selector"
+        required: false
+        default: "all"
+        type: string
 
 concurrency:
   group: "${{ github.workflow }}-${{ github.ref }}"
@@ -143,7 +150,7 @@ jobs:
           # GERRIT_SERVERS is a repository variable (not secret) containing:
           # [{"project":"ONAP","slug":"onap","gerrit":"gerrit.onap.org",...}]
           GERRIT_SERVERS: ${{ vars.GERRIT_SERVERS }}
-          SLUG_FILTER: ${{ inputs.slug_filter }}
+          SLUG_SELECTOR: ${{ inputs.slug_selector }}
         run: |
           # Set matrix from GERRIT_SERVERS repository variable
           if [ -z "$GERRIT_SERVERS" ]; then
@@ -164,23 +171,46 @@ jobs:
           echo "Full matrix prepared with $COUNT Gerrit servers"
 
           # Output filtered matrix for debug tests
-          if [ -z "$SLUG_FILTER" ] || [ "$SLUG_FILTER" = "all" ]; then
-            # Empty filter or "all" = all servers
+          if [ -z "$SLUG_SELECTOR" ] || [ "$SLUG_SELECTOR" = "all" ]; then
+            # Empty selector or "all" = all servers
             DEBUG_MATRIX="$MATRIX"
-            echo "Debug matrix: all $COUNT servers (no filter)"
+            echo "Debug matrix: all $COUNT servers (no selector)"
           else
-            # Filter to specific slug
+            # Parse comma/space-separated selectors and support wildcards
+            # Convert to newline-separated, trim whitespace
+            SELECTORS=$(echo "$SLUG_SELECTOR" | tr ',' '\n' | tr ' ' '\n' | \
+              sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$')
+
+            echo "Selectors to match:"
+            echo "$SELECTORS"
+
+            # Build jq filter for each selector (wildcards supported)
+            # Convert shell wildcards to regex: * -> .*, ? -> .
             DEBUG_MATRIX=$(echo "$GERRIT_SERVERS" | \
-              jq -c --arg slug "$SLUG_FILTER" \
-              '[.[] | select(.slug == $slug)]')
+              jq -c --arg selectors "$SELECTORS" '
+              ($selectors | split("\n")) as $sels |
+              [.[] | . as $server |
+                select(
+                  any($sels[]; . as $sel |
+                    if ($sel | contains("*")) or ($sel | contains("?")) then
+                      # Convert glob to regex: * -> .*, ? -> .
+                      ($sel | gsub("\\*"; ".*") | gsub("\\?"; ".")) as $regex |
+                      ($server.slug | test("^" + $regex + "$"))
+                    else
+                      $server.slug == $sel
+                    end
+                  )
+                )
+              ]
+            ')
             DEBUG_COUNT=$(echo "$DEBUG_MATRIX" | jq '. | length')
             if [ "$DEBUG_COUNT" -eq 0 ]; then
-              echo "::error::No server found for slug: $SLUG_FILTER"
+              echo "::error::No servers matched selector: $SLUG_SELECTOR"
               echo "Available slugs:"
               echo "$GERRIT_SERVERS" | jq -r '.[].slug'
               exit 1
             fi
-            echo "Debug matrix: $DEBUG_COUNT server(s) (filter: $SLUG_FILTER)"
+            echo "Debug matrix: $DEBUG_COUNT server(s) [$SLUG_SELECTOR]"
           fi
           echo "debug_matrix=$DEBUG_MATRIX" >> "$GITHUB_OUTPUT"
           DEBUG_COUNT=$(echo "$DEBUG_MATRIX" | jq '. | length')
@@ -807,6 +837,7 @@ jobs:
         id: build-matrix
         env:
           GERRIT_SERVERS: ${{ vars.GERRIT_SERVERS }}
+          GITHUB_SELECTOR: ${{ inputs.github_selector }}
         run: |
           # Build matrix with all github orgs (github_org and github_gerrit_org)
           # Each entry maps a GitHub org to its source Gerrit server
@@ -821,9 +852,9 @@ jobs:
             exit 1
           fi
 
-          # Build matrix: for each server, create entries for both github_org
-          # and github_gerrit_org
-          MATRIX=$(echo "$GERRIT_SERVERS" | jq -c '
+          # Build full matrix: for each server, create entries for both
+          # github_org and github_gerrit_org
+          FULL_MATRIX=$(echo "$GERRIT_SERVERS" | jq -c '
             [.[] |
               {
                 github_org: .github_org,
@@ -841,6 +872,51 @@ jobs:
               }
             ]
           ')
+
+          FULL_COUNT=$(echo "$FULL_MATRIX" | jq '. | length')
+          echo "Full matrix has $FULL_COUNT GitHub organizations"
+
+          # Apply github_selector filter
+          if [ -z "$GITHUB_SELECTOR" ] || [ "$GITHUB_SELECTOR" = "all" ]; then
+            # Empty selector or "all" = all orgs
+            MATRIX="$FULL_MATRIX"
+            echo "Using all $FULL_COUNT GitHub organizations (no selector)"
+          else
+            # Parse comma/space-separated selectors and support wildcards
+            # Convert to newline-separated, trim whitespace
+            SELECTORS=$(echo "$GITHUB_SELECTOR" | tr ',' '\n' | tr ' ' '\n' | \
+              sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$')
+
+            echo "GitHub org selectors to match:"
+            echo "$SELECTORS"
+
+            # Build jq filter for each selector (wildcards supported)
+            # Convert shell wildcards to regex: * -> .*, ? -> .
+            MATRIX=$(echo "$FULL_MATRIX" | jq -c --arg selectors "$SELECTORS" '
+              ($selectors | split("\n")) as $sels |
+              [.[] | . as $org |
+                select(
+                  any($sels[]; . as $sel |
+                    if ($sel | contains("*")) or ($sel | contains("?")) then
+                      # Convert glob to regex: * -> .*, ? -> .
+                      ($sel | gsub("\\*"; ".*") | gsub("\\?"; ".")) as $regex |
+                      ($org.github_org | test("^" + $regex + "$"))
+                    else
+                      $org.github_org == $sel
+                    end
+                  )
+                )
+              ]
+            ')
+            MATCH_COUNT=$(echo "$MATRIX" | jq '. | length')
+            if [ "$MATCH_COUNT" -eq 0 ]; then
+              echo "::error::No GitHub orgs matched selector: $GITHUB_SELECTOR"
+              echo "Available GitHub organizations:"
+              echo "$FULL_MATRIX" | jq -r '.[].github_org'
+              exit 1
+            fi
+            echo "Matched $MATCH_COUNT orgs (selector: $GITHUB_SELECTOR)"
+          fi
 
           echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
           COUNT=$(echo "$MATRIX" | jq '. | length')
