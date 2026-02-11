@@ -672,7 +672,7 @@ jobs:
           fi
 
           {
-            echo "# 🔧 Debug Session: $SERVER_NAME"
+            echo "# 🖥️ Gerrit Server Online: $SERVER_NAME"
             echo ""
             echo "## 🌐 Public Access Ports"
             echo ""
@@ -746,7 +746,7 @@ jobs:
 
           echo ""
           echo "========================================"
-          echo "  DEBUG SESSION ACTIVE"
+          echo "  GERRIT SERVER ONLINE"
           echo "========================================"
           for t in "${TUNNELS[@]}"; do
             IFS='|' read -r _ LABEL _ _ URL <<< "$t"
@@ -763,7 +763,7 @@ jobs:
         run: |
           # Keep the session alive for the specified duration
           echo "Session will remain active for $DEBUG_MINUTES minutes..."
-          echo "Cancel the workflow manually when you're done debugging."
+          echo "Cancel the workflow manually when you're done."
           echo ""
 
           TOTAL_SECONDS=$((DEBUG_MINUTES * 60))
@@ -788,7 +788,7 @@ jobs:
             ELAPSED=$((ELAPSED + INTERVAL))
           done
 
-          echo "Debug session time expired."
+          echo "Session time expired."
 
       - name: "Cleanup"
         if: always()
