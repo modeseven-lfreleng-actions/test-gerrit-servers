@@ -506,7 +506,8 @@ jobs:
             bore-ssh.log 2>/dev/null || echo "")
 
           if [ -n "$HTTP_PORT" ] && [ -n "$SSH_PORT" ]; then
-            TUNNEL_PORTS=$(jq -n \
+            # Use -c for compact JSON to avoid multi-line output issues
+            TUNNEL_PORTS=$(jq -c -n \
               --arg slug "$SERVER_SLUG" \
               --argjson http "$HTTP_PORT" \
               --argjson ssh "$SSH_PORT" \
@@ -943,70 +944,38 @@ jobs:
         with:
           egress-policy: audit
 
-      - name: "Install gerrit-clone CLI"
-        run: |
-          # Install uv if not available
-          if ! command -v uv &> /dev/null; then
-            echo "Installing uv..."
-            curl -LsSf https://astral.sh/uv/install.sh | sh
-            export PATH="$HOME/.cargo/bin:$PATH"
-          fi
-
-          # Create wrapper for gerrit-clone
-          mkdir -p "$HOME/.local/bin"
-          cat > "$HOME/.local/bin/gerrit-clone" << 'WRAPPER'
-          #!/bin/bash
-          exec uvx gerrit-clone "$@"
-          WRAPPER
-          chmod +x "$HOME/.local/bin/gerrit-clone"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          export PATH="$HOME/.local/bin:$PATH"
-
-          # Verify installation
-          gerrit-clone --version
-
       - name: "Reset GitHub org: ${{ matrix.org.github_org }}"
-        env:
-          GITHUB_TOKEN: ${{ secrets.ORG_ADMIN_TOKEN }}
-          GITHUB_ORG: ${{ matrix.org.github_org }}
-        run: |
-          # Forcibly remove all repositories from the GitHub organization
-          echo "Resetting GitHub organization: $GITHUB_ORG"
-          echo "WARNING: This will delete ALL repositories in $GITHUB_ORG"
-
-          gerrit-clone reset \
-            --org "$GITHUB_ORG" \
-            --no-confirm \
-            --verbose
-
-          echo "Reset complete for $GITHUB_ORG"
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/gerrit-clone-action@c2b3f2427cabb780ece1d4df425a912abc439b5a # v1.0.0
+        with:
+          command: reset
+          github-org: ${{ matrix.org.github_org }}
+          github-token: ${{ secrets.ORG_ADMIN_TOKEN }}
+          force-reset: "true"
+          verbose: "true"
 
       - name: "Mirror Gerrit to GitHub: ${{ matrix.org.github_org }}"
-        env:
-          GITHUB_TOKEN: ${{ secrets.ORG_ADMIN_TOKEN }}
-          GITHUB_ORG: ${{ matrix.org.github_org }}
-          GERRIT_SERVER: ${{ matrix.org.gerrit }}
-        run: |
-          # Mirror all Gerrit content to the GitHub organization
-          echo "Mirroring from $GERRIT_SERVER to $GITHUB_ORG"
-
-          gerrit-clone mirror \
-            --server "$GERRIT_SERVER" \
-            --org "$GITHUB_ORG" \
-            --output-path "/tmp/mirror-${GITHUB_ORG}" \
-            --discovery-method http \
-            --https \
-            --recreate \
-            --overwrite \
-            --verbose
-
-          echo "Mirror complete for $GITHUB_ORG"
+        id: mirror
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/gerrit-clone-action@c2b3f2427cabb780ece1d4df425a912abc439b5a # v1.0.0
+        with:
+          command: mirror
+          host: ${{ matrix.org.gerrit }}
+          github-org: ${{ matrix.org.github_org }}
+          github-token: ${{ secrets.ORG_ADMIN_TOKEN }}
+          output-path: "/tmp/mirror-${{ matrix.org.github_org }}"
+          recreate-repos: "true"
+          overwrite-local: "true"
+          verbose: "true"
 
       - name: "Report results"
         if: always()
         env:
           GITHUB_ORG: ${{ matrix.org.github_org }}
           GERRIT_SERVER: ${{ matrix.org.gerrit }}
+          SUCCESS_COUNT: ${{ steps.mirror.outputs.success-count }}
+          FAILURE_COUNT: ${{ steps.mirror.outputs.failure-count }}
+          TOTAL_COUNT: ${{ steps.mirror.outputs.total-count }}
         run: |
           {
             echo "## Resync: $GITHUB_ORG"
@@ -1016,14 +985,9 @@ jobs:
             echo "| GitHub Org | \`$GITHUB_ORG\` |"
             echo "| Gerrit Server | \`$GERRIT_SERVER\` |"
             echo "| Status | ${{ job.status }} |"
-            echo ""
-            if [ -f "/tmp/mirror-${GITHUB_ORG}/mirror-manifest.json" ]; then
-              echo "### Mirror Results"
-              echo '```json'
-              jq '{total, succeeded, failed, skipped, duration_s}' \
-                "/tmp/mirror-${GITHUB_ORG}/mirror-manifest.json"
-              echo '```'
-            fi
+            echo "| Total | $TOTAL_COUNT |"
+            echo "| Succeeded | $SUCCESS_COUNT |"
+            echo "| Failed | $FAILURE_COUNT |"
           } >> "$GITHUB_STEP_SUMMARY"
 
 
