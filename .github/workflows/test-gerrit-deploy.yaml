@@ -27,9 +27,9 @@ on:
           - "false"
       slug_selector:
         # Supports: 'all', single value, comma/space-separated, wildcards (*,?)
-        description: "Server slug selector"
+        description: "Persistent project selector (slug)"
         required: false
-        default: "all"
+        default: "onap"
         type: string
       debug_minutes:
         description: "Minutes to keep debug session open (max 60)"
@@ -57,7 +57,7 @@ on:
         type: boolean
       github_selector:
         # Supports: 'all', single value, comma/space-separated, wildcards (*,?)
-        description: "GitHub org selector"
+        description: "Clear these GitHub orgs (slug)"
         required: false
         default: "all"
         type: string
