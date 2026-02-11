@@ -40,7 +40,7 @@ on:
         # e.g., /r, /infra
         description: "Match origin server URL API path"
         required: false
-        default: "false"
+        default: "true"
         type: choice
         options:
           - "true"
